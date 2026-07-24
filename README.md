@@ -28,12 +28,26 @@ Then open the URL Vite prints (default <http://localhost:5173>).
 **Fire** — `src/elements/fire.js`
 
 A true volumetric raymarch, not layered billboards. The mesh is only a bounding
-sphere; each fragment solves ray/sphere intersection analytically and walks the
-segment in 38 steps, accumulating emission and absorption. Density comes from
-four octaves of `|noise|` turbulence — the folds at each octave's zero crossings
-are what give fire its torn, wispy structure — shaped into a teardrop and
-scrolled upward, with finer octaves scrolling faster. Because the flame is
-integrated in world space it holds up from every angle, including from inside.
+ellipsoid, fitted to the flame's silhouette; each fragment solves the
+intersection analytically and walks the segment accumulating emission and
+absorption. Density comes from four octaves of `|noise|` turbulence — the folds
+at each octave's zero crossings are what give fire its torn, wispy structure —
+squashed vertically so features stretch into tongues, with finer octaves
+scrolling upward faster. Because the flame is integrated in world space it holds
+up from every angle, including from inside.
+
+Three things do most of the visual work:
+
+- **Emission spans orders of magnitude.** Intensity goes as the cube of
+  temperature, so the bulk of the volume sits in deep orange while the densest
+  core reaches many times display white and tone mapping burns it out the way a
+  camera would. A linear ramp gives flat orange no matter how bright you push it.
+- **Temperature is gated on the flame's axis, not just its density.** That
+  confines white heat to a narrow column, leaving orange flanks and deep red
+  outer wisps. The spread across one silhouette is where the contrast comes from.
+- **It composites with premultiplied alpha, not additive blending.** Additive can
+  only brighten, so a flame built on it can never have a dark side. Premultiplied
+  "over" lets cool sooty gas at the crown *occlude* the glow behind it.
 
 **Water** — `src/elements/water.js`
 
@@ -76,9 +90,22 @@ There are no `THREE.Light` objects in the scene. Every surface is a custom
 real lights would shade nothing.
 
 Post-processing is `RenderPass → UnrealBloomPass → OutputPass → FXAAPass`, with
-ACES filmic tone mapping. The bloom threshold sits above 1.0 on purpose: only
+ACES filmic tone mapping. The bloom threshold sits high on purpose: only
 genuinely hot things — the flame core, the lava, the specular glints — bloom.
-Device pixel ratio is capped at 1.75, since the raymarch is fill-rate bound.
+
+The fire dominates GPU time; measured with `EXT_disjoint_timer_query_webgl2`, it
+was ~70% of a frame when framed to fill the screen. Three changes cut that by
+~59% at matched settings, with no visible difference: a bounding **ellipsoid**
+instead of a sphere (a sphere large enough to hold a tall narrow column is mostly
+empty, and every extra covered pixel still pays for a full march), a **fixed
+world-space step size** so chords clipping the silhouette exit early instead of
+spending a full sample budget on a sliver, and **four turbulence octaves instead
+of five** — the fifth is sub-pixel at any normal viewing distance. Device pixel
+ratio is capped at 1.5 for the same reason.
+
+One trap worth knowing if you edit the shaders: they live in JS template
+literals, so a stray backtick in a GLSL comment silently terminates the string
+and the whole module fails to parse. `node --check src/**/*.js` catches it.
 
 `window.__scene` is exposed for tuning from the console, including
 `__scene.renderAt(t)` to render a single frame at an arbitrary time.

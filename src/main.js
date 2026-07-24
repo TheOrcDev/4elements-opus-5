@@ -31,9 +31,10 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 
-// The volumetric fire is the expensive pass; capping DPR keeps it honest on
-// high-density displays without visibly softening anything.
-const maxDpr = 1.75;
+// The volumetric fire dominates GPU time — it is a per-pixel raymarch, so its
+// cost scales directly with this. 1.5 still resolves the flame's fine detail on
+// a retina panel while costing ~25% fewer pixels than 1.75.
+const maxDpr = 1.5;
 let pixelRatio = Math.min(window.devicePixelRatio, maxDpr);
 renderer.setPixelRatio(pixelRatio);
 
@@ -59,7 +60,7 @@ controls.target.set(0, 0.4, 0);
 // Fire's radius is its bounding volume, not its silhouette — the flame only
 // fills the middle ~70% of it — so it needs a larger number than the others to
 // carry comparable weight in the ring.
-const fire = createFire({ radius: 2.05 });
+const fire = createFire({ radius: 2.35 });
 const water = createWater({ radius: 1.5 });
 const earth = createEarth({ radius: 1.6 });
 const air = createAir({ radius: 1.85 });

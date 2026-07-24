@@ -32,6 +32,7 @@ uniform vec3 uPos[N_ELEM];
 uniform vec3 uCol[N_ELEM];
 uniform float uRad[N_ELEM];
 uniform float uPower[N_ELEM];
+uniform float uPulse[N_ELEM];   // live intensity, e.g. the fire's flicker
 uniform float uRingRadius;
 uniform float uFade;
 
@@ -72,10 +73,12 @@ void main() {
     float rr = uRad[i];
     vec3 tint = uCol[i] * uPower[i];
 
-    // --- pooled light on the stone
+    // --- pooled light on the stone. Only the pool tracks the live pulse: a
+    // flickering rune ring reads as a rendering glitch, but firelight that
+    // doesn't dance on the floor reads as a decal.
     float d = length(P - C);
     float pool = rr * rr * 1.9 / (d * d + 0.6);
-    col += tint * pool * 0.075;
+    col += tint * pool * 0.075 * uPulse[i];
 
     // --- rune circle directly beneath the element
     float dxz = length(P.xz - C.xz);
@@ -94,7 +97,7 @@ void main() {
       float edge = sqrt(d2) - rr;
       float blur = 1.0 + rough * 2.4 + tca * 0.16;
       float blob = exp(-max(edge, 0.0) * (2.6 / blur));
-      col += tint * blob * fres * 0.60;
+      col += tint * blob * fres * 0.60 * uPulse[i];
     }
   }
 
@@ -183,8 +186,11 @@ export function createWorld({ elements, ringRadius, floorY }) {
     uTime: { value: 0 },
     uPos: { value: elements.map(() => new THREE.Vector3()) },
     uCol: { value: elements.map((e) => e.color.clone()) },
-    uRad: { value: elements.map((e) => e.radius) },
+    // An element whose visible body is much narrower than its bounding volume
+    // (the fire is a column inside a big sphere) gives a floorRadius instead.
+    uRad: { value: elements.map((e) => e.floorRadius ?? e.radius) },
     uPower: { value: elements.map(() => 1) },
+    uPulse: { value: elements.map(() => 1) },
     uRingRadius: { value: ringRadius },
     uFade: { value: 1 },
   };
@@ -279,6 +285,7 @@ export function createWorld({ elements, ringRadius, floorY }) {
       for (let i = 0; i < elements.length; i++) {
         elements[i].group.getWorldPosition(worldPos);
         floorUniforms.uPos.value[i].copy(worldPos);
+        floorUniforms.uPulse.value[i] = elements[i].pulse ?? 1;
       }
     },
 

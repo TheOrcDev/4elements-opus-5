@@ -4693,7 +4693,7 @@ vec3 curlField(vec3 p, float t) {
 
   return c;
 }
-`,Wl=900,Gl=`
+`,Wl=1500,Gl=`
 varying vec3 vWorld;
 void main() {
   vec4 wp = modelMatrix * vec4(position, 1.0);
@@ -4705,7 +4705,8 @@ precision highp float;
 
 uniform float uTime;
 uniform vec3  uCenter;
-uniform float uRadius;
+uniform vec3  uAxes;        // ellipsoid semi-axes, world units
+uniform vec3  uFlameScale;  // unit-ellipsoid space -> flame space
 uniform float uIntensity;
 uniform float uFlicker;
 
@@ -4713,97 +4714,143 @@ varying vec3 vWorld;
 
 ${Hl}
 
-// Blackbody-ish ramp: ember red -> orange -> gold -> white core.
-// The pale end is deliberately squeezed into the top 10% — let white start
-// earlier and the whole flame desaturates into a grey-white smear.
+// Blackbody-ish ramp: deep ember red -> blood orange -> amber -> gold -> white.
+// The pale end is squeezed into the top ~12%. Let white start earlier and the
+// whole flame desaturates into a grey smear.
 vec3 fireRamp(float t) {
   t = clamp(t, 0.0, 1.0);
-  vec3 c = mix(vec3(0.20, 0.006, 0.0), vec3(0.95, 0.115, 0.008), smoothstep(0.0, 0.30, t));
-  c = mix(c, vec3(1.0, 0.34, 0.020), smoothstep(0.28, 0.58, t));
-  c = mix(c, vec3(1.0, 0.66, 0.100), smoothstep(0.58, 0.86, t));
-  c = mix(c, vec3(1.0, 0.93, 0.640), smoothstep(0.91, 1.0, t));
+  vec3 c = mix(vec3(0.30, 0.008, 0.002), vec3(0.90, 0.055, 0.004), smoothstep(0.00, 0.22, t));
+  c = mix(c, vec3(1.00, 0.185, 0.010), smoothstep(0.20, 0.48, t));
+  c = mix(c, vec3(1.00, 0.420, 0.035), smoothstep(0.46, 0.70, t));
+  c = mix(c, vec3(1.00, 0.720, 0.170), smoothstep(0.68, 0.90, t));
+  c = mix(c, vec3(1.00, 0.950, 0.790), smoothstep(0.90, 1.00, t));
   return c;
 }
 
-// Density of the flame body at a point inside the unit bounding sphere.
-// Returns density in .x and the normalised height in .y (reused for colour).
-//
-// The flame is defined in a space 1/FIT larger than the bounding sphere, so the
-// body only ever occupies the middle of the volume. Let it reach the sphere
-// wall and the silhouette gets sliced flat where the marched segment runs out.
-#define FIT 0.70
-
 // Turbulence — |noise| summed over octaves — rather than plain fbm. The folds
 // at each octave's zero crossings are exactly the wispy, torn structure fire
-// has; smooth fbm gives you a rolling cloud instead. Each octave scrolls upward
-// faster than the last, so fine detail races through the coarse silhouette.
+// has; smooth fbm gives you a rolling cloud instead.
+//
+// Sample space is squashed vertically first: rising gas stretches, so features
+// need to be taller than they are wide or the flame reads as bubbling soup.
+// Each octave also scrolls upward faster than the last, so fine detail races
+// through the coarse silhouette the way real flame does.
 float fireTurb(vec3 p, float t) {
+  p.y *= 0.42;
+
+  // Four octaves, not five. This runs once per raymarch step for every covered
+  // pixel, so it dominates the whole scene's cost; the fifth octave's detail is
+  // sub-pixel at any normal viewing distance and is not worth 20% of frame time.
   float f = 0.0;
   float a = 0.5;
   for (int i = 0; i < 4; i++) {
     vec3 q = p;
-    q.y -= t * (0.95 + float(i) * 0.62);
+    q.y -= t * (1.15 + float(i) * 0.80);
     f += a * abs(snoise(q));
-    p *= 2.12;
+    p *= 2.14;
     a *= 0.5;
   }
-  // |snoise| averages ~0.24, so four weighted octaves land around 0.23. Scale
-  // it back to roughly 0..1 with a mean near 0.5 — every consumer below reads
-  // it as a normalised field, and skipping this quietly halves the density.
-  return clamp(f * 2.1, 0.0, 1.0);
+  // |snoise| averages ~0.24, so four weighted octaves land around 0.225. Scale
+  // back to roughly 0..1 with a mean near 0.5 — every consumer below reads it
+  // as a normalised field, and skipping this quietly halves the density.
+  return clamp(f * 2.12, 0.0, 1.0);
 }
 
-// Returns density in .x, normalised height in .y, turbulence in .z.
-vec3 flame(vec3 raw, float t) {
-  vec3 p = raw / FIT;
-  float h = clamp((p.y + 0.94) / 1.86, 0.0, 1.0);
+// Returns density in .x, normalised height in .y, turbulence in .z, and how
+// close to the flame's axis the sample sits in .w.
+//
+// The point arrives in flame space: y runs about -0.95 to 0.93 over the
+// flame's height, and the body reaches a radius of roughly 0.65.
+vec4 flame(vec3 p, float t) {
+  float h = (p.y + 0.95) / 1.88;
+  if (h < 0.0 || h > 1.0) return vec4(0.0);
 
   // Teardrop: pinched at the wick, bulging at the shoulder, tapering to a tip.
-  // A flame is far taller than it is wide — let the radius creep past ~0.35 of
-  // the half-height and it reads as a bonfire puddle rather than a flame.
-  float taper = pow(1.0 - h, 0.55);
-  float foot  = smoothstep(0.0, 0.16, h);
-  float radius = 0.36 * taper * (0.30 + 0.86 * foot);
+  // A flame is far taller than it is wide — let the radius creep much past this
+  // and it reads as a bonfire puddle rather than a flame.
+  // Roughly 1.7:1 tall-to-wide. Slimmer than this and the flame reads as a
+  // thin candle next to the other elements' volumes; much fatter and it stops
+  // reading as a flame at all.
+  float taper = pow(1.0 - h, 0.52);
+  float foot  = smoothstep(0.0, 0.14, h);
+  float radius = 0.56 * taper * (0.30 + 0.88 * foot);
 
-  vec3 q = p * vec3(2.30, 1.15, 2.30);
-  q.xz *= rot2(p.y * 0.70 + t * 0.25);
+  // Cheap rejection before the expensive turbulence: nothing beyond the widest
+  // possible envelope can contribute, and most of the bounding sphere is out
+  // there. This is what pays for the fifth octave.
+  float rxz = length(p.xz);
+  if (rxz > radius + 0.45) return vec4(0.0);
+
+  // Base frequency has to put several features across the flame's width. Much
+  // lower and the coarsest octave spans the whole column, so it shifts the
+  // silhouette bodily instead of breaking it into tongues.
+  vec3 q = p * 3.40;
+  q.xz *= rot2(p.y * 0.75 + t * 0.28);
   float turb = fireTurb(q, t);
 
   // Centre the turbulence so it both eats gaps into the body and throws
   // tongues out past it, biting harder toward the tip.
-  float bite = (turb - 0.50) * (0.18 + 0.55 * h);
+  float bite = (turb - 0.50) * (0.24 + 0.70 * h);
+  float d = rxz - radius + bite;
 
-  float d = length(p.xz) - radius + bite;
-  float dens = (1.0 - smoothstep(-0.05, 0.15, d));
+  // Two separate falloffs, and keeping them separate is the point.
+  //
+  // The edge stays narrow: it carries the licking tongues, and widening it to
+  // get an interior gradient smears them into a smooth egg.
+  float edge = 1.0 - smoothstep(-0.06, 0.10, d);
 
-  // Same turbulence modulates the interior, so the body is never a solid slug.
-  dens *= 0.45 + 0.85 * turb;
+  // The interior gradient instead comes from distance to the axis, so the
+  // flame is dense along its centreline and thin at its flanks without the
+  // silhouette losing its bite.
+  float core = 1.0 - smoothstep(0.15, 1.05, rxz / max(radius, 1e-4));
 
-  dens *= (1.0 - smoothstep(0.55, 1.0, h));          // dissolve at the tip
-  dens *= smoothstep(-0.97, -0.82, p.y);     // soften the base
-  dens *= (1.0 - smoothstep(0.82, 1.0, length(raw))); // never touch the sphere wall
-  dens *= 0.72 + 0.28 * uFlicker;
+  // Turbulence has to carve actual voids through the interior, not just
+  // modulate its amplitude. Scaling density by something like (0.4 + 0.9*turb)
+  // never reaches zero, so every view ray integrates a continuous slab and the
+  // structure averages away into a smooth column. Thresholding punches real
+  // holes, and those holes are the tongues.
+  float wisp = smoothstep(0.16, 0.60, turb);
+  float dens = edge * (0.30 + 0.80 * core) * wisp;
 
-  return vec3(clamp(dens, 0.0, 1.0), h, turb);
+  dens *= 1.0 - smoothstep(0.70, 1.0, h);            // dissolve at the tip
+  dens *= smoothstep(-0.97, -0.80, p.y);             // soften the base
+  dens *= 0.70 + 0.30 * uFlicker;
+
+  return vec4(clamp(dens, 0.0, 1.0), h, turb, core);
 }
 
 void main() {
-  vec3 ro = cameraPosition;
-  vec3 rd = normalize(vWorld - ro);
+  // Bound the flame with a fitted ellipsoid rather than a sphere. The flame is
+  // a tall narrow column, so a sphere large enough to contain it is mostly
+  // empty — and every one of those extra covered pixels still pays for a full
+  // march. Squeezing the bound to the silhouette roughly halves the shaded
+  // area and shortens every ray segment, which is by far the cheapest
+  // performance win available here.
+  //
+  // Dividing the ray by the semi-axes turns the ellipsoid into a unit sphere,
+  // so the intersection stays a two-line quadratic. The ray parameter remains
+  // a world distance because the direction is normalised before the divide.
+  vec3 rdW = normalize(vWorld - cameraPosition);
+  vec3 ro = (cameraPosition - uCenter) / uAxes;
+  vec3 rd = rdW / uAxes;
 
-  vec3 oc = ro - uCenter;
-  float b = dot(oc, rd);
-  float c = dot(oc, oc) - uRadius * uRadius;
-  float disc = b * b - c;
+  float a = dot(rd, rd);
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - 1.0;
+  float disc = b * b - a * c;
   if (disc < 0.0) discard;
 
   float sq = sqrt(disc);
-  float tN = max(-b - sq, 0.0);
-  float tF = -b + sq;
+  float tN = max((-b - sq) / a, 0.0);
+  float tF = (-b + sq) / a;
   if (tF <= tN) discard;
 
-  const int STEPS = 38;
-  float dt = (tF - tN) / float(STEPS);
+  // Fixed step size rather than dividing each chord into the same count. A ray
+  // clipping the silhouette spans a sliver of volume and has no business
+  // spending a full budget of samples on it; sizing dt so only a ray down the
+  // long axis uses all of them lets every shorter chord exit early.
+  const int MAX_STEPS = 34;
+  float dt = (2.0 * uAxes.y) / float(MAX_STEPS);
 
   // Dither the entry point to trade banding for a little grain.
   float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
@@ -4811,37 +4858,76 @@ void main() {
 
   vec3 acc = vec3(0.0);
   float transmittance = 1.0;
+  float halo = 0.0;
 
-  for (int i = 0; i < STEPS; i++) {
-    if (transmittance < 0.012) break;
+  for (int i = 0; i < MAX_STEPS; i++) {
+    if (t > tF || transmittance < 0.008) break;
 
-    vec3 p = (ro + rd * t - uCenter) / uRadius;
-    vec3 f = flame(p, uTime);
-    float dens = f.x;
+    vec3 pe = ro + rd * t;          // unit-ellipsoid space
+    vec3 p = pe * uFlameScale;      // flame space
 
-    if (dens > 0.004) {
-      // Hot only where the flame is genuinely thick, and cooling as it climbs.
-      // The exponent matters: a linear ramp puts most of the volume at the
-      // white end, which is what turns a flame into a light bulb. Folding the
-      // turbulence in again gives hot cores inside cooler tongues.
-      float temp = pow(dens, 1.5) * (1.02 - 0.62 * f.y) * (0.58 + 0.80 * f.z);
+    // Heat halo: a soft falloff just past the column, integrated as we go for
+    // free. Without it the flame ends abruptly at its own silhouette and reads
+    // as a cut-out rather than something radiating into the air around it.
+    // The falloff has to stay tight — the column is only ~0.6 wide here, and a
+    // gentler curve paints the whole bounding volume as a visible orange disc.
+    halo += exp(-length(p.xz) * 4.4) *
+            (1.0 - smoothstep(-0.4, 0.7, p.y)) * (dt / uAxes.y);
+
+    vec4 f = flame(p, uTime);
+    // Fade out before the bound, or the silhouette gets sliced flat where the
+    // marched segment runs out.
+    float dens = f.x * (1.0 - smoothstep(0.86, 1.0, length(pe)));
+
+    if (dens > 0.003) {
+      // The luminous zone of a real flame is a band sitting just above the
+      // base, not a ramp starting at it. A linear falloff from h=0 saturates
+      // the entire bottom of the flame into one white slab.
+      //
+      // Gating on the axial term too confines white heat to a narrow column,
+      // so the flanks stay orange and the outer wisps stay deep red. That
+      // spread across a single silhouette is where the contrast comes from —
+      // and folding the turbulence back in puts hot cores inside cooler
+      // tongues, which is what reads as fire rather than as a gradient.
+      // The axial exponent is high for a reason. The core term is a smoothstep,
+      // so it stays near 1 across a good half of the flame's width — to a
+      // gentle power and the entire body saturates white and the ramp's whole
+      // orange range goes unused. At 3.5 the white core is confined to roughly
+      // the inner quarter, gold sits around 40% out, and the flanks fall away
+      // through orange into deep red.
+      float heat = smoothstep(0.0, 0.10, f.y) * (1.0 - smoothstep(0.28, 0.82, f.y));
+      float temp = pow(dens, 0.9) * pow(f.w, 3.5) * heat * (0.45 + 0.85 * f.z) * 1.25;
       temp = clamp(temp, 0.0, 1.0);
 
-      // Emission stays modest and absorption runs high: an optically thick
-      // flame keeps its silhouette and internal tongues instead of
-      // integrating into one white blob.
-      vec3 emit = fireRamp(temp) * (0.14 + 1.30 * temp * temp);
-      acc += emit * dens * dt * transmittance * 5.5;
-      transmittance *= exp(-dens * dt * 9.5);
+      // The cubic is the whole trick: it keeps the bulk of the volume down in
+      // the deep-orange range while letting the densest core reach values many
+      // times display white, so tone mapping burns it out the way a camera
+      // does. Contrast comes from that spread, not from overall brightness.
+      vec3 emit = fireRamp(temp) * (0.05 + 7.5 * temp * temp * temp);
+
+      // Cool, sooty gas gathering at the crown. It absorbs hard and emits
+      // almost nothing, so the tip silhouettes against the glow behind it
+      // instead of just fading out — the dark side a flame needs.
+      float soot = smoothstep(0.50, 0.95, f.y) * dens;
+
+      // Optical thickness is a legibility control as much as a physical one:
+      // a thin flame integrates its whole depth into mush, while a thicker one
+      // is dominated by the samples nearest the camera, so the turbulent
+      // structure at its surface actually survives to the screen.
+      acc += emit * dens * dt * transmittance * 3.1;
+      transmittance *= exp(-(dens * 7.5 + soot * 11.0) * dt);
     }
 
     t += dt;
   }
 
+  acc += vec3(1.0, 0.30, 0.065) * halo * 0.55;
   acc *= uIntensity;
 
+  // Premultiplied "over": emission adds, density occludes. The halo carries no
+  // alpha, so it stays purely additive glow around the silhouette.
   float alpha = clamp(1.0 - transmittance, 0.0, 1.0);
-  if (alpha < 0.002) discard;
+  if (alpha < 0.0015 && dot(acc, vec3(1.0)) < 0.0025) discard;
 
   gl_FragColor = vec4(acc, alpha);
 }
@@ -4852,48 +4938,61 @@ uniform float uPixelRatio;
 attribute vec3 aSeed;    // spawn offset around the wick
 attribute float aPhase;  // life offset so embers don't pulse in lockstep
 attribute float aSpeed;
+attribute float aScale;  // a few big slow sparks among many small fast ones
 
 varying float vLife;
 varying float vHeat;
+varying float vScale;
 
 void main() {
-  float life = fract(aPhase + uTime * aSpeed * 0.16);
+  float life = fract(aPhase + uTime * aSpeed * 0.15);
   vLife = life;
+  vScale = aScale;
 
-  float rise = life * 3.8;
+  float rise = life * (3.4 + aScale * 2.2);
 
   // Wander widens as the ember cools and loses the plume.
-  float wander = 0.22 + life * 1.05;
+  float wander = 0.20 + life * 1.15;
   vec3 p = aSeed;
   p.y += rise;
-  p.x += sin(uTime * 1.4 * aSpeed + aPhase * 41.0 + rise * 1.3) * wander * 0.52;
-  p.z += cos(uTime * 1.2 * aSpeed + aPhase * 27.0 + rise * 1.1) * wander * 0.52;
+  p.x += sin(uTime * 1.4 * aSpeed + aPhase * 41.0 + rise * 1.3) * wander * 0.55;
+  p.z += cos(uTime * 1.2 * aSpeed + aPhase * 27.0 + rise * 1.1) * wander * 0.55;
 
-  vHeat = 1.0 - smoothstep(0.0, 0.75, life);
+  vHeat = 1.0 - smoothstep(0.0, 0.72, life);
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   gl_Position = projectionMatrix * mv;
-  gl_PointSize = (1.7 + 3.8 * vHeat) * uPixelRatio * (12.0 / -mv.z);
+  gl_PointSize = (1.8 + 5.5 * aScale) * (0.35 + 0.9 * vHeat) * uPixelRatio * (12.0 / -mv.z);
 }
 `,Jl=`
 precision highp float;
 varying float vLife;
 varying float vHeat;
+varying float vScale;
 
 void main() {
   vec2 uv = gl_PointCoord - 0.5;
+
+  // Squashing y stretches the sprite vertically, which reads as the motion
+  // blur of something travelling fast straight up.
+  uv.y *= 0.42;
   float d = length(uv);
   if (d > 0.5) discard;
 
-  float core = (1.0 - smoothstep(0.0, 0.5, d));
-  float glow = pow(core, 3.0);
+  // Squared so the falloff is soft rather than a hard-edged capsule — at this
+  // aspect ratio a linear edge reads as a little rectangle, not a spark.
+  float core = 1.0 - smoothstep(0.0, 0.5, d);
+  core *= core;
+  float glow = pow(core, 2.0);
 
-  vec3 col = mix(vec3(1.0, 0.22, 0.03), vec3(1.0, 0.92, 0.62), vHeat * vHeat);
-  float fade = smoothstep(0.0, 0.08, vLife) * (1.0 - smoothstep(0.55, 1.0, vLife));
+  // Cooling embers slide from white-gold down to deep red before they die.
+  vec3 col = mix(vec3(1.0, 0.16, 0.02), vec3(1.0, 0.94, 0.70), vHeat * vHeat);
+  float fade = smoothstep(0.0, 0.06, vLife) * (1.0 - smoothstep(0.5, 1.0, vLife));
 
-  gl_FragColor = vec4(col * (0.30 + 1.1 * glow), core * fade * (0.035 + 0.22 * vHeat));
+  gl_FragColor = vec4(col * (0.4 + 2.6 * glow) * (0.35 + 1.4 * vHeat),
+                      core * fade * (0.05 + 0.32 * vHeat));
 }
-`;function Yl({radius:e=1.55}={}){let t=new Nn,n={uTime:{value:0},uCenter:{value:new G},uRadius:{value:e},uIntensity:{value:1},uFlicker:{value:1}},r=new X({uniforms:n,vertexShader:Gl,fragmentShader:Kl,transparent:!0,depthWrite:!1,blending:2,side:0}),i=new ri(new Mi(e,24,18),r);i.frustumCulled=!1,t.add(i);let a=new Pr,o=new Float32Array(Wl*3),s=new Float32Array(Wl),c=new Float32Array(Wl);for(let t=0;t<Wl;t++){let n=Math.random()*Math.PI*2,r=Math.sqrt(Math.random())*.34;o[t*3+0]=Math.cos(n)*r,o[t*3+1]=-e*.55+Math.random()*.7,o[t*3+2]=Math.sin(n)*r,s[t]=Math.random(),c[t]=.65+Math.random()*.85}a.setAttribute(`position`,new Y(o.slice(),3)),a.setAttribute(`aSeed`,new Y(o,3)),a.setAttribute(`aPhase`,new Y(s,1)),a.setAttribute(`aSpeed`,new Y(c,1));let l=new X({uniforms:{uTime:{value:0},uPixelRatio:{value:Math.min(window.devicePixelRatio,2)}},vertexShader:ql,fragmentShader:Jl,transparent:!0,depthWrite:!1,blending:2}),u=new bi(a,l);u.frustumCulled=!1,t.add(u);let d=new G;return{name:`fire`,group:t,radius:e,color:new J(16738847),hitRadius:e*1.05,update(t,a,o){let s=.72+.16*Math.sin(t*11.3)+.1*Math.sin(t*27.7+1.3)+.08*Math.sin(t*4.1+.7);n.uTime.value=t,n.uFlicker.value=s,l.uniforms.uTime.value=t,i.getWorldPosition(d),n.uCenter.value.copy(d);let c=+(o.position.distanceTo(d)<e*1.06);r.side!==c&&(r.side=c,r.needsUpdate=!0)},setPixelRatio(e){l.uniforms.uPixelRatio.value=e},particleCount:Wl}}var Xl=900,Zl=`
+`;function Yl({radius:e=1.55}={}){let t=new Nn,n=new G(.75,1.12,.75),r=n.clone().multiplyScalar(.72*e),i={uTime:{value:0},uCenter:{value:new G},uAxes:{value:r},uFlameScale:{value:n},uIntensity:{value:1},uFlicker:{value:1}},a=new X({uniforms:i,vertexShader:Gl,fragmentShader:Kl,transparent:!0,depthWrite:!1,blending:1,premultipliedAlpha:!0,side:0}),o=new ri(new Mi(1,24,18),a);o.scale.copy(r),o.frustumCulled=!1,t.add(o);let s=new Pr,c=new Float32Array(Wl*3),l=new Float32Array(Wl),u=new Float32Array(Wl),d=new Float32Array(Wl);for(let t=0;t<Wl;t++){let n=Math.random()*Math.PI*2,r=Math.sqrt(Math.random())*.3*e;c[t*3+0]=Math.cos(n)*r,c[t*3+1]=-e*.55+Math.random()*.7,c[t*3+2]=Math.sin(n)*r,l[t]=Math.random(),u[t]=.65+Math.random()*.9,d[t]=Math.random()**3}s.setAttribute(`position`,new Y(c.slice(),3)),s.setAttribute(`aSeed`,new Y(c,3)),s.setAttribute(`aPhase`,new Y(l,1)),s.setAttribute(`aSpeed`,new Y(u,1)),s.setAttribute(`aScale`,new Y(d,1));let f=new X({uniforms:{uTime:{value:0},uPixelRatio:{value:Math.min(window.devicePixelRatio,2)}},vertexShader:ql,fragmentShader:Jl,transparent:!0,depthWrite:!1,blending:2}),p=new bi(s,f);p.frustumCulled=!1,t.add(p);let m=new G,h=new G;return{name:`fire`,group:t,radius:e,floorRadius:e*.62,color:new J(16738847),hitRadius:e*.9,pulse:1,update(e,t,n){let s=.72+.16*Math.sin(e*11.3)+.1*Math.sin(e*27.7+1.3)+.08*Math.sin(e*4.1+.7);i.uTime.value=e,i.uFlicker.value=s,i.uIntensity.value=.88+.24*s,f.uniforms.uTime.value=e,this.pulse=.78+.42*s,o.getWorldPosition(m),i.uCenter.value.copy(m),h.copy(n.position).sub(m).divide(r);let c=+(h.length()<1.06);a.side!==c&&(a.side=c,a.needsUpdate=!0)},setPixelRatio(e){f.uniforms.uPixelRatio.value=e},particleCount:Wl}}var Xl=900,Zl=`
 uniform float uTime;
 uniform float uRadius;
 uniform float uAmp;
@@ -5414,6 +5513,7 @@ uniform vec3 uPos[N_ELEM];
 uniform vec3 uCol[N_ELEM];
 uniform float uRad[N_ELEM];
 uniform float uPower[N_ELEM];
+uniform float uPulse[N_ELEM];   // live intensity, e.g. the fire's flicker
 uniform float uRingRadius;
 uniform float uFade;
 
@@ -5454,10 +5554,12 @@ void main() {
     float rr = uRad[i];
     vec3 tint = uCol[i] * uPower[i];
 
-    // --- pooled light on the stone
+    // --- pooled light on the stone. Only the pool tracks the live pulse: a
+    // flickering rune ring reads as a rendering glitch, but firelight that
+    // doesn't dance on the floor reads as a decal.
     float d = length(P - C);
     float pool = rr * rr * 1.9 / (d * d + 0.6);
-    col += tint * pool * 0.075;
+    col += tint * pool * 0.075 * uPulse[i];
 
     // --- rune circle directly beneath the element
     float dxz = length(P.xz - C.xz);
@@ -5476,7 +5578,7 @@ void main() {
       float edge = sqrt(d2) - rr;
       float blur = 1.0 + rough * 2.4 + tca * 0.16;
       float blob = exp(-max(edge, 0.0) * (2.6 / blur));
-      col += tint * blob * fres * 0.60;
+      col += tint * blob * fres * 0.60 * uPulse[i];
     }
   }
 
@@ -5547,4 +5649,4 @@ void main() {
   float core = (1.0 - smoothstep(0.0, 0.5, d));
   gl_FragColor = vec4(vColor * (0.4 + 1.6 * pow(core, 2.5)), core * vTwinkle * 0.85);
 }
-`;function Du({elements:e,ringRadius:t,floorY:n}){let r=new Nn,i={uTime:{value:0},uPos:{value:e.map(()=>new G)},uCol:{value:e.map(e=>e.color.clone())},uRad:{value:e.map(e=>e.radius)},uPower:{value:e.map(()=>1)},uRingRadius:{value:t},uFade:{value:1}},a=new ri(new Di(40,96),new X({uniforms:i,vertexShader:xu,fragmentShader:Su}));a.rotation.x=-Math.PI/2,a.position.y=n,r.add(a);let o=new ri(new Mi(120,32,24),new X({uniforms:{uTime:{value:0}},vertexShader:Cu,fragmentShader:wu,side:1,depthWrite:!1}));r.add(o);let s=new Pr,c=new Float32Array(bu*3),l=new Float32Array(bu),u=new Float32Array(bu),d=new Float32Array(bu*3),f=new J(16767408),p=new J(11455487),m=new J;for(let e=0;e<bu;e++){let t=Math.random()*2-1,n=Math.random()*Math.PI*2,r=Math.sqrt(1-t*t),i=60+Math.random()*45;c[e*3+0]=r*Math.cos(n)*i,c[e*3+1]=t*i*.75+12,c[e*3+2]=r*Math.sin(n)*i,l[e]=.7+Math.random()**3*3.2,u[e]=Math.random(),m.copy(Math.random()>.7?f:p).lerp(new J(16777215),Math.random()*.6),d[e*3+0]=m.r,d[e*3+1]=m.g,d[e*3+2]=m.b}s.setAttribute(`position`,new Y(c,3)),s.setAttribute(`aSize`,new Y(l,1)),s.setAttribute(`aPhase`,new Y(u,1)),s.setAttribute(`aColor`,new Y(d,3));let h=new X({uniforms:{uTime:{value:0},uPixelRatio:{value:Math.min(window.devicePixelRatio,2)}},vertexShader:Tu,fragmentShader:Eu,transparent:!0,depthWrite:!1,blending:2}),g=new bi(s,h);g.frustumCulled=!1,r.add(g);let _=new G;return{group:r,floor:a,update(t){i.uTime.value=t,o.material.uniforms.uTime.value=t,h.uniforms.uTime.value=t,g.rotation.y=t*.004;for(let t=0;t<e.length;t++)e[t].group.getWorldPosition(_),i.uPos.value[t].copy(_)},setEmphasis(t){for(let n=0;n<e.length;n++){let r=t===`all`||e[n].name===t;i.uPower.value[n]=r?1:.25}},setPixelRatio(e){h.uniforms.uPixelRatio.value=e},starCount:bu}}var Ou=7.4,ku=-3.1,Au=document.getElementById(`scene`),ju=new rl({canvas:Au,antialias:!1,powerPreference:`high-performance`,stencil:!1});ju.setSize(window.innerWidth,window.innerHeight),ju.outputColorSpace=Ke,ju.toneMapping=4,ju.toneMappingExposure=1;var Mu=1.75,Nu=Math.min(window.devicePixelRatio,Mu);ju.setPixelRatio(Nu);var Pu=new Vn,Fu=new pa(46,window.innerWidth/window.innerHeight,.1,400);Fu.position.set(0,5.2,19);var Iu=new pl(Fu,Au);Iu.enableDamping=!0,Iu.dampingFactor=.055,Iu.minDistance=3,Iu.maxDistance=46,Iu.maxPolarAngle=Math.PI*.505,Iu.autoRotate=!0,Iu.autoRotateSpeed=.32,Iu.target.set(0,.4,0);var Lu=Yl({radius:2.05}),Ru=tu({radius:1.5}),zu=[Lu,Ru,uu({radius:1.6}),yu({radius:1.85})];zu.forEach((e,t)=>{let n=t/zu.length*Math.PI*2+Math.PI/4;e.group.position.set(Math.cos(n)*Ou,.35,Math.sin(n)*Ou),Pu.add(e.group)}),Ru.setFireDirection(Lu.group.position.clone().sub(Ru.group.position));var Bu=Du({elements:zu,ringRadius:Ou,floorY:ku});Pu.add(Bu.group);var Vu=new Pl(ju);Vu.setPixelRatio(Nu),Vu.setSize(window.innerWidth,window.innerHeight),Vu.addPass(new Fl(Pu,Fu));var Hu=new Ll(new W(window.innerWidth,window.innerHeight),.62,.5,.85);Vu.addPass(Hu),Vu.addPass(new zl),Vu.addPass(new Vl);var Uu={pos:Fu.position.clone(),target:Iu.target.clone()},Wu=!1,Gu=`all`,Ku=new G,qu={pos:new G(0,5.2,19),target:new G(0,.4,0)};function Ju(e){Gu=e,Bu.setEmphasis(e);for(let t of document.querySelectorAll(`.elem-btn`))t.classList.toggle(`active`,t.dataset.target===e);if(document.getElementById(`r-focus`).textContent=e,e===`all`)Uu.pos.copy(qu.pos),Uu.target.copy(qu.target),Iu.autoRotate=!0;else{let t=zu.find(t=>t.name===e),n=t.group.position,r=new G(n.x,0,n.z).normalize();r.applyAxisAngle(new G(0,1,0),.42),Uu.pos.copy(n).addScaledVector(r,t.radius*3.5).add(new G(0,1.35,0)),Uu.target.copy(n),Iu.autoRotate=!1}Wu=!0,Iu.enabled=!1}for(let e of document.querySelectorAll(`.elem-btn`))e.addEventListener(`click`,()=>Ju(e.dataset.target));var Yu=new Pa,Xu=new W,Zu=new G,Qu=null;Au.addEventListener(`pointerdown`,e=>{Qu={x:e.clientX,y:e.clientY},Wu=!1,Iu.enabled=!0}),Au.addEventListener(`pointerup`,e=>{if(!Qu||Math.hypot(e.clientX-Qu.x,e.clientY-Qu.y)>5)return;Xu.x=e.clientX/window.innerWidth*2-1,Xu.y=-(e.clientY/window.innerHeight)*2+1,Yu.setFromCamera(Xu,Fu);let t=null,n=1/0;for(let e of zu){if(e.group.getWorldPosition(Zu),Yu.ray.distanceSqToPoint(Zu)>e.hitRadius*e.hitRadius)continue;let r=Zu.distanceTo(Fu.position);r<n&&(n=r,t=e)}t&&Ju(t.name===Gu?`all`:t.name)}),Au.addEventListener(`wheel`,()=>{Wu=!1,Iu.enabled=!0},{passive:!0});function $u(){let e=window.innerWidth,t=window.innerHeight;Nu=Math.min(window.devicePixelRatio,Mu),Fu.aspect=e/t,Fu.updateProjectionMatrix(),ju.setPixelRatio(Nu),ju.setSize(e,t),Vu.setPixelRatio(Nu),Vu.setSize(e,t);for(let e of zu)e.setPixelRatio?.(Nu);Bu.setPixelRatio(Nu)}window.addEventListener(`resize`,$u);var ed=0,td=performance.now(),nd=document.getElementById(`r-fps`),rd=0,id=0,ad=zu.reduce((e,t)=>e+(t.particleCount||0),0)+Bu.starCount;document.getElementById(`r-parts`).textContent=ad.toLocaleString();function od(){requestAnimationFrame(od);let e=performance.now(),t=Math.min((e-td)/1e3,.05);if(td=e,ed+=t,Wu){let e=1-.0016**t;Fu.position.lerp(Uu.pos,e),Iu.target.lerp(Uu.target,e);let n=Uu.pos.distanceTo(Uu.target);Ku.copy(Fu.position).sub(Uu.target),Ku.length()<n&&Fu.position.copy(Uu.target).add(Ku.setLength(n)),Fu.position.distanceTo(Uu.pos)<.06&&Iu.target.distanceTo(Uu.target)<.06&&(Fu.position.copy(Uu.pos),Iu.target.copy(Uu.target),Wu=!1,Iu.enabled=!0)}for(let e of zu)e.update(ed,t,Fu);Bu.update(ed),Iu.update(),Ru.updateEnvironment(ju,Pu),Vu.render(),rd+=t,id++,rd>=.25&&(nd.textContent=Math.round(id/rd),rd=0,id=0)}Ru.updateEnvironment(ju,Pu);for(let e of zu)e.update(0,0,Fu);Bu.update(0),Vu.render();var sd=document.getElementById(`loader`),cd=()=>sd.classList.add(`done`);requestAnimationFrame(cd),setTimeout(cd,1200),od(),window.__scene={scene:Pu,camera:Fu,renderer:ju,composer:Vu,bloom:Hu,elements:zu,world:Bu,focusOn:Ju,renderAt(e){ed=e;for(let t of zu)t.update(e,1/60,Fu);Bu.update(e),Ru.updateEnvironment(ju,Pu),Vu.render()}};
+`;function Du({elements:e,ringRadius:t,floorY:n}){let r=new Nn,i={uTime:{value:0},uPos:{value:e.map(()=>new G)},uCol:{value:e.map(e=>e.color.clone())},uRad:{value:e.map(e=>e.floorRadius??e.radius)},uPower:{value:e.map(()=>1)},uPulse:{value:e.map(()=>1)},uRingRadius:{value:t},uFade:{value:1}},a=new ri(new Di(40,96),new X({uniforms:i,vertexShader:xu,fragmentShader:Su}));a.rotation.x=-Math.PI/2,a.position.y=n,r.add(a);let o=new ri(new Mi(120,32,24),new X({uniforms:{uTime:{value:0}},vertexShader:Cu,fragmentShader:wu,side:1,depthWrite:!1}));r.add(o);let s=new Pr,c=new Float32Array(bu*3),l=new Float32Array(bu),u=new Float32Array(bu),d=new Float32Array(bu*3),f=new J(16767408),p=new J(11455487),m=new J;for(let e=0;e<bu;e++){let t=Math.random()*2-1,n=Math.random()*Math.PI*2,r=Math.sqrt(1-t*t),i=60+Math.random()*45;c[e*3+0]=r*Math.cos(n)*i,c[e*3+1]=t*i*.75+12,c[e*3+2]=r*Math.sin(n)*i,l[e]=.7+Math.random()**3*3.2,u[e]=Math.random(),m.copy(Math.random()>.7?f:p).lerp(new J(16777215),Math.random()*.6),d[e*3+0]=m.r,d[e*3+1]=m.g,d[e*3+2]=m.b}s.setAttribute(`position`,new Y(c,3)),s.setAttribute(`aSize`,new Y(l,1)),s.setAttribute(`aPhase`,new Y(u,1)),s.setAttribute(`aColor`,new Y(d,3));let h=new X({uniforms:{uTime:{value:0},uPixelRatio:{value:Math.min(window.devicePixelRatio,2)}},vertexShader:Tu,fragmentShader:Eu,transparent:!0,depthWrite:!1,blending:2}),g=new bi(s,h);g.frustumCulled=!1,r.add(g);let _=new G;return{group:r,floor:a,update(t){i.uTime.value=t,o.material.uniforms.uTime.value=t,h.uniforms.uTime.value=t,g.rotation.y=t*.004;for(let t=0;t<e.length;t++)e[t].group.getWorldPosition(_),i.uPos.value[t].copy(_),i.uPulse.value[t]=e[t].pulse??1},setEmphasis(t){for(let n=0;n<e.length;n++){let r=t===`all`||e[n].name===t;i.uPower.value[n]=r?1:.25}},setPixelRatio(e){h.uniforms.uPixelRatio.value=e},starCount:bu}}var Ou=7.4,ku=-3.1,Au=document.getElementById(`scene`),ju=new rl({canvas:Au,antialias:!1,powerPreference:`high-performance`,stencil:!1});ju.setSize(window.innerWidth,window.innerHeight),ju.outputColorSpace=Ke,ju.toneMapping=4,ju.toneMappingExposure=1;var Mu=1.5,Nu=Math.min(window.devicePixelRatio,Mu);ju.setPixelRatio(Nu);var Pu=new Vn,Fu=new pa(46,window.innerWidth/window.innerHeight,.1,400);Fu.position.set(0,5.2,19);var Iu=new pl(Fu,Au);Iu.enableDamping=!0,Iu.dampingFactor=.055,Iu.minDistance=3,Iu.maxDistance=46,Iu.maxPolarAngle=Math.PI*.505,Iu.autoRotate=!0,Iu.autoRotateSpeed=.32,Iu.target.set(0,.4,0);var Lu=Yl({radius:2.35}),Ru=tu({radius:1.5}),zu=[Lu,Ru,uu({radius:1.6}),yu({radius:1.85})];zu.forEach((e,t)=>{let n=t/zu.length*Math.PI*2+Math.PI/4;e.group.position.set(Math.cos(n)*Ou,.35,Math.sin(n)*Ou),Pu.add(e.group)}),Ru.setFireDirection(Lu.group.position.clone().sub(Ru.group.position));var Bu=Du({elements:zu,ringRadius:Ou,floorY:ku});Pu.add(Bu.group);var Vu=new Pl(ju);Vu.setPixelRatio(Nu),Vu.setSize(window.innerWidth,window.innerHeight),Vu.addPass(new Fl(Pu,Fu));var Hu=new Ll(new W(window.innerWidth,window.innerHeight),.62,.5,.85);Vu.addPass(Hu),Vu.addPass(new zl),Vu.addPass(new Vl);var Uu={pos:Fu.position.clone(),target:Iu.target.clone()},Wu=!1,Gu=`all`,Ku=new G,qu={pos:new G(0,5.2,19),target:new G(0,.4,0)};function Ju(e){Gu=e,Bu.setEmphasis(e);for(let t of document.querySelectorAll(`.elem-btn`))t.classList.toggle(`active`,t.dataset.target===e);if(document.getElementById(`r-focus`).textContent=e,e===`all`)Uu.pos.copy(qu.pos),Uu.target.copy(qu.target),Iu.autoRotate=!0;else{let t=zu.find(t=>t.name===e),n=t.group.position,r=new G(n.x,0,n.z).normalize();r.applyAxisAngle(new G(0,1,0),.42),Uu.pos.copy(n).addScaledVector(r,t.radius*3.5).add(new G(0,1.35,0)),Uu.target.copy(n),Iu.autoRotate=!1}Wu=!0,Iu.enabled=!1}for(let e of document.querySelectorAll(`.elem-btn`))e.addEventListener(`click`,()=>Ju(e.dataset.target));var Yu=new Pa,Xu=new W,Zu=new G,Qu=null;Au.addEventListener(`pointerdown`,e=>{Qu={x:e.clientX,y:e.clientY},Wu=!1,Iu.enabled=!0}),Au.addEventListener(`pointerup`,e=>{if(!Qu||Math.hypot(e.clientX-Qu.x,e.clientY-Qu.y)>5)return;Xu.x=e.clientX/window.innerWidth*2-1,Xu.y=-(e.clientY/window.innerHeight)*2+1,Yu.setFromCamera(Xu,Fu);let t=null,n=1/0;for(let e of zu){if(e.group.getWorldPosition(Zu),Yu.ray.distanceSqToPoint(Zu)>e.hitRadius*e.hitRadius)continue;let r=Zu.distanceTo(Fu.position);r<n&&(n=r,t=e)}t&&Ju(t.name===Gu?`all`:t.name)}),Au.addEventListener(`wheel`,()=>{Wu=!1,Iu.enabled=!0},{passive:!0});function $u(){let e=window.innerWidth,t=window.innerHeight;Nu=Math.min(window.devicePixelRatio,Mu),Fu.aspect=e/t,Fu.updateProjectionMatrix(),ju.setPixelRatio(Nu),ju.setSize(e,t),Vu.setPixelRatio(Nu),Vu.setSize(e,t);for(let e of zu)e.setPixelRatio?.(Nu);Bu.setPixelRatio(Nu)}window.addEventListener(`resize`,$u);var ed=0,td=performance.now(),nd=document.getElementById(`r-fps`),rd=0,id=0,ad=zu.reduce((e,t)=>e+(t.particleCount||0),0)+Bu.starCount;document.getElementById(`r-parts`).textContent=ad.toLocaleString();function od(){requestAnimationFrame(od);let e=performance.now(),t=Math.min((e-td)/1e3,.05);if(td=e,ed+=t,Wu){let e=1-.0016**t;Fu.position.lerp(Uu.pos,e),Iu.target.lerp(Uu.target,e);let n=Uu.pos.distanceTo(Uu.target);Ku.copy(Fu.position).sub(Uu.target),Ku.length()<n&&Fu.position.copy(Uu.target).add(Ku.setLength(n)),Fu.position.distanceTo(Uu.pos)<.06&&Iu.target.distanceTo(Uu.target)<.06&&(Fu.position.copy(Uu.pos),Iu.target.copy(Uu.target),Wu=!1,Iu.enabled=!0)}for(let e of zu)e.update(ed,t,Fu);Bu.update(ed),Iu.update(),Ru.updateEnvironment(ju,Pu),Vu.render(),rd+=t,id++,rd>=.25&&(nd.textContent=Math.round(id/rd),rd=0,id=0)}Ru.updateEnvironment(ju,Pu);for(let e of zu)e.update(0,0,Fu);Bu.update(0),Vu.render();var sd=document.getElementById(`loader`),cd=()=>sd.classList.add(`done`);requestAnimationFrame(cd),setTimeout(cd,1200),od(),window.__scene={scene:Pu,camera:Fu,renderer:ju,composer:Vu,bloom:Hu,elements:zu,world:Bu,focusOn:Ju,renderAt(e){ed=e;for(let t of zu)t.update(e,1/60,Fu);Bu.update(e),Ru.updateEnvironment(ju,Pu),Vu.render()}};
